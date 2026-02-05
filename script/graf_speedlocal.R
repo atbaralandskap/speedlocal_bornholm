@@ -14,7 +14,7 @@ nodes <- tribble(
   
   # Dashboards / deliveries
   "dash",               "Dashboards & maps\n(Quarto/Shiny, sliders)",                        "output",
-  "lablab_method",      "LABLAB\n(metodutveckling)",                                         "output",
+  "lablab_method",      "Metodutveckling",                                         "output",
   "speedlocal_delivery","SpeedLocal\n(leverans & beslutstöd)",                               "output",
   
   # Social
@@ -137,6 +137,68 @@ new_edges <- tibble::tribble(
 edges <- dplyr::bind_rows(edges, new_edges) |>
   dplyr::distinct(from, to, .keep_all = TRUE)
 
+nodes <- dplyr::add_row(
+  nodes,
+  id    = "kartapplikation",
+  label = "Kartapplikation\n(webbkarta, interaktiv vy)",
+  group = "output"
+)
+
+edges <- dplyr::add_row(
+  edges,
+  from = "dash",
+  to   = "kartapplikation"
+)
+
+nodes <- dplyr::add_row(
+  nodes,
+  id    = "energilandskap",
+  label = "Energilandskap\n(energi, sociala värden, landskap i relation)",
+  group = "output"
+)
+
+edges <- dplyr::add_row(
+  edges,
+  from = "kartapplikation",
+  to   = "energilandskap"
+)
+
+
+edges <- dplyr::add_row(
+  edges,
+  from = "kartapplikation",
+  to   = "lablab_method"
+)
+
+edges <- dplyr::add_row(
+  edges,
+  from = "lablab_method",
+  to   = "dash"
+)
+
+edges <- edges %>%
+  dplyr::filter(!(from == "dash" & to == "speedlocal_delivery"))
+
+edges <- dplyr::add_row(
+  edges,
+  from = "kartapplikation",
+  to   = "speedlocal_delivery"
+)
+
+nodes <- nodes %>%
+  mutate(
+    label = ifelse(
+      id == "kartapplikation",
+      "Kartapplikation\n(interaktiv utforskning av scenarier & acceptans)",
+      label
+    )
+  )
+
+edges <- dplyr::add_row(
+  edges,
+  from = "dash",
+  to   = "kartapplikation"
+)
 
 # ---- Visualisation ------------------------------------------------
 
