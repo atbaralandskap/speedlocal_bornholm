@@ -2,7 +2,23 @@
 <html lang="en">
 <head>
 <meta charset="utf-8" />
-<style>body{background-color:white;}</style>
+<style>
+  html, body {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    background-color: white;
+    overflow: hidden;
+  }
+
+  /* htmlwidgets / visNetwork container */
+  .html-widget {
+    width: 100% !important;
+    height: 100vh !important;
+  }
+</style>
+
 <script>(function() {
   // If window.HTMLWidgets is already defined, then use it; otherwise create a
   // new object. This allows preceding code to set options that affect the
