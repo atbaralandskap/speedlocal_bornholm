@@ -91,9 +91,56 @@ edges <- tribble(
 ) %>%
   distinct(from, to, .keep_all = TRUE)
 
+# --------- new nodes and edges ----------------------
+
+# ---- Add new nodes ------------------------------------------------
+
+new_nodes <- tibble::tribble(
+  ~id,            ~label,                                           ~group,
+  "streamlit",    "Streamlit app / interaktiv karta",               "output",
+  "gislab",       "GISLab",                                         "core",
+  "github",       "GitHub\n(repo, issues, versionering)",           "core"
+)
+
+nodes <- dplyr::bind_rows(nodes, new_nodes) |>
+  dplyr::distinct(id, .keep_all = TRUE)
+
+# ---- Add new edges ------------------------------------------------
+
+new_edges <- tibble::tribble(
+  ~from,       ~to,
+  
+  # Streamlit <-> PostGIS
+  "streamlit", "postgis",
+  "postgis",   "streamlit",
+  
+  # Streamlit <-> DuckDB
+  "streamlit", "duckdb",
+  "duckdb",    "streamlit",
+  
+  # Streamlit <-> EML
+  "streamlit", "eml",
+  "eml",       "streamlit",
+  
+  # GISLab -> GIS analysis (NOT reciprocal)
+  "gislab",    "gis_analysis",
+  
+  # GitHub <-> EML
+  "github",    "eml",
+  "eml",       "github",
+  
+  # GitHub <-> GISLab
+  "github",    "gislab",
+  "gislab",    "github"
+)
+
+edges <- dplyr::bind_rows(edges, new_edges) |>
+  dplyr::distinct(from, to, .keep_all = TRUE)
+
+
 # ---- Visualisation ------------------------------------------------
 
-visNetwork(nodes, edges, width = "100%", height = "700px") |>
+visNetwork(nodes, edges, width = "100%", height = "100vh") |>
   visEdges(arrows = "to") |>
   visGroups(groupname = "core",           color = "#ffd92f") |>
   visGroups(groupname = "database",       color = "#8da0cb") |>
