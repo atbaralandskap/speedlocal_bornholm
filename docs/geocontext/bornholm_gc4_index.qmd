@@ -1,0 +1,50 @@
+---
+title: "Bornholm GC4 Interpretation Hub"
+format:
+  html:
+    toc: true
+---
+
+## Overview
+
+This page links the full Bornholm GC4 outputs:
+
+- Main snapshot: [bornholm_gc4_report.html](./bornholm_gc4_report.html)
+- Factor pages:
+- [F1](./bornholm_gc4_F1.html)
+- [F2](./bornholm_gc4_F2.html)
+- [F3](./bornholm_gc4_F3.html)
+- [F4](./bornholm_gc4_F4.html)
+- [F5](./bornholm_gc4_F5.html)
+
+## How To Read
+
+1. Start with the main snapshot for class balance, map, and loadings matrix.
+2. Open each factor page for:
+- factor score map
+- z-score map
+- hotspot/coldspot view
+- distribution + class profile
+- loading vs K diagnostics
+
+For non-technical readers:
+
+- `Cluster` means "areas with similar multi-factor profiles."
+- `Factor` means "a compressed pattern made from several indicators."
+- `z-score` means "how unusual this hexagon is compared to the island average."
+
+## Quick Interpretation Notes
+
+- `F1`: primarily accessibility/settlement intensity (roads + fastboende dominant).
+- `F2`: mainly cultural-historical conservation structure.
+- `F3`: mainly ecological connectivity structure.
+- `F4`: mixed secondary variance (often local heterogeneity effects).
+- `F5`: tertiary residual pattern; inspect with caution and compare with z-hotspots.
+
+## Reproducible Build
+
+Use the one-command script:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File script/09_render_bornholm_gc4_reports.ps1
+```
