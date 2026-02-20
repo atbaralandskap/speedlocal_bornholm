@@ -1,0 +1,618 @@
+---
+title: "Bornholm GC4 Snapshot"
+format:
+  html:
+    toc: true
+    code-fold: true
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Read This First
+
+This report translates many technical steps into a simple question:
+which places on Bornholm are similar, different, and why?
+
+How to read:
+
+1. `Cluster` = groups of hexagons with similar factor profiles (`F1..F5`).
+2. `Factor` = a data pattern that combines many indicators into one score.
+3. High/low factor scores do not mean "good/bad" by themselves; they mean
+"more/less of this pattern."
+
+## What Is A Cluster Built On, And Why?
+
+Clusters (`class_km`) are built from the factor scores (`F1..F5`), not from one
+single raw layer. This is useful because:
+
+- it reduces many variables to a smaller set of patterns,
+- it groups areas that behave similarly across several indicators,
+- it makes map interpretation easier than comparing dozens of raw layers.
+
+Use clusters as a navigation aid, not as a final truth.
+
+```{r}
+#| label: setup
+suppressPackageStartupMessages({
+  library(DBI)
+  library(RPostgres)
+  library(sf)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+  library(ggplot2)
+  library(leaflet)
+  library(scales)
+})
+
+indicator_key <- function(x) {
+  case_when(
+    str_detect(x, "roads") ~ "roads",
+    str_detect(x, "fastboende|fastboendebefolkning") ~ "fastboende",
+    str_detect(x, "ecology|oekologiskfor") ~ "ecology",
+    str_detect(x, "cultural|historical|kultur") ~ "cultural",
+    TRUE ~ "other"
+  )
+}
+
+indicator_palette <- c(
+  roads = "#1f78b4",
+  fastboende = "#e31a1c",
+  ecology = "#33a02c",
+  cultural = "#ff7f00",
+  other = "#6a3d9a"
+)
+
+class_palette <- c(
+  "0" = "#8dd3c7",
+  "1" = "#fdb462",
+  "2" = "#bebada",
+  "3" = "#fccde5",
+  "4" = "#b3de69",
+  "5" = "#ffed6f",
+  "6" = "#bc80bd",
+  "7" = "#80b1d3",
+  "8" = "#fb8072",
+  "9" = "#ccebc5"
+)
+```
+
+```{r}
+#| label: connect
+# Locate and source shared DB helper (walk up from current dir)
+root_candidates <- c(
+  normalizePath(getwd(), winslash = "/", mustWork = FALSE),
+  normalizePath(file.path(getwd(), ".."), winslash = "/", mustWork = FALSE),
+  normalizePath(file.path(getwd(), "..", ".."), winslash = "/", mustWork = FALSE)
+)
+db_connect_candidates <- unlist(lapply(root_candidates, function(r) {
+  c(
+    file.path(r, "R/db_connect.R"),
+    file.path(r, "databas/generell_databas_setup/R/db_connect.R"),
+    file.path(r, "generell_databas_setup/R/db_connect.R")
+  )
+}))
+db_connect_path <- db_connect_candidates[file.exists(db_connect_candidates)][1]
+if (is.na(db_connect_path) || !nzchar(db_connect_path)) {
+  stop("Could not find db_connect.R")
+}
+source(db_connect_path)
+project_root <- dirname(dirname(db_connect_path))
+
+env_candidates <- c(
+  Sys.getenv("PIPELINE_ENV_PATH", unset = ""),
+  file.path(project_root, ".env"),
+  file.path(project_root, "..", ".env")
+)
+env_candidates <- env_candidates[nzchar(env_candidates)]
+cfg_env <- env_candidates[file.exists(env_candidates)][1]
+if (is.na(cfg_env) || !nzchar(cfg_env)) {
+  stop("No .env file found for DB connection")
+}
+schema <- Sys.getenv("PIPELINE_SCHEMA", "h3")
+view_gc4 <- Sys.getenv("QGIS_VIEW_FACTORS_GC4", "v_bornholm_r8_factors_gc4")
+features_table <- Sys.getenv("GC_FEATURES_TABLE", "bornholm_r8_geocontext_features")
+factors_table <- Sys.getenv("GC4_FACTORS_TABLE", "bornholm_r8_factors_gc4")
+
+con <- if ("path" %in% names(formals(connect_pg))) {
+  connect_pg(cfg_env)
+} else if ("cfg_env" %in% names(formals(connect_pg))) {
+  connect_pg(cfg_env)
+} else {
+  if (exists("load_pg_env", mode = "function")) load_pg_env(cfg_env)
+  DBI::dbConnect(
+    RPostgres::Postgres(),
+    dbname = Sys.getenv("PGDATABASE"),
+    host = Sys.getenv("PGHOST", "localhost"),
+    port = as.integer(Sys.getenv("PGPORT", "5432")),
+    user = Sys.getenv("PGUSER"),
+    password = Sys.getenv("PGPASSWORD")
+  )
+}
+```
+
+```{r}
+#| label: load-data
+qry <- sprintf("SELECT * FROM %s.%s", schema, view_gc4)
+gc4 <- st_read(con, query = qry, quiet = TRUE)
+gc4 <- st_transform(gc4, 4326)
+
+cat("Rows:", nrow(gc4), "\n")
+cat("Columns:", ncol(gc4), "\n")
+```
+
+```{r}
+#| label: load-feature-factor-join
+feat <- NULL
+feat_source <- "none"
+
+# 1) Try DB table join first
+qry_join <- sprintf(
+  "SELECT f.*, s.\"F1\", s.\"F2\", s.\"F3\", s.\"F4\", s.\"F5\", s.class_km
+   FROM %s.%s f
+   LEFT JOIN %s.%s s ON f.hex_id = s.hex_id",
+  schema, features_table, schema, factors_table
+)
+feat_db <- tryCatch(dbGetQuery(con, qry_join), error = function(e) NULL)
+
+has_k_cols <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return(FALSE)
+  any(str_detect(names(df), "^mean_gc_.*_k[0-9]+$"))
+}
+
+if (has_k_cols(feat_db)) {
+  feat <- feat_db
+  feat_source <- "database"
+} else {
+  # 2) Fallback to notebook CSV outputs
+  ctx_candidates <- c(
+    file.path(project_root, "jyp_note_book_geocontext", "bornholm_points_with_context_gc4.csv"),
+    file.path(project_root, "bornholm_points_with_context_gc4.csv")
+  )
+  score_candidates <- c(
+    file.path(project_root, "jyp_note_book_geocontext", "bornholm_r8_factor_scores_gc4.csv"),
+    file.path(project_root, "bornholm_r8_factor_scores_gc4.csv")
+  )
+  ctx_path <- ctx_candidates[file.exists(ctx_candidates)][1]
+  score_path <- score_candidates[file.exists(score_candidates)][1]
+
+  if (!is.na(ctx_path) && nzchar(ctx_path)) {
+    feat_ctx <- read.csv(ctx_path, stringsAsFactors = FALSE)
+    if (!is.na(score_path) && nzchar(score_path)) {
+      feat_scores <- read.csv(score_path, stringsAsFactors = FALSE)
+      feat <- feat_ctx |>
+        left_join(feat_scores, by = "hex_id")
+      feat_source <- "csv_context+scores"
+    } else {
+      feat <- feat_ctx
+      feat_source <- "csv_context"
+    }
+  } else if (!is.null(feat_db)) {
+    feat <- feat_db
+    feat_source <- "database_no_k_cols"
+  }
+}
+
+if (is.null(feat)) stop("Could not load feature data from DB or CSV fallback")
+cat("Feature source:", feat_source, "\n")
+cat("Feature rows:", nrow(feat), "\n")
+cat("Feature columns:", ncol(feat), "\n")
+```
+
+## Cluster Distribution (`class_km`)
+
+This bar chart shows how many hexagons belong to each cluster.  
+If one cluster is much larger than others, it likely captures the "typical"
+landscape profile.
+
+```{r}
+if ("class_km" %in% names(gc4)) {
+  gc4 |>
+    st_drop_geometry() |>
+    count(class_km, name = "n_hex") |>
+    ggplot(aes(x = factor(class_km), y = n_hex, fill = factor(class_km))) +
+    geom_col(show.legend = FALSE) +
+    scale_fill_manual(values = class_palette, drop = FALSE) +
+    scale_y_continuous(labels = comma) +
+    labs(x = "class_km", y = "Hex count") +
+    theme_minimal(base_size = 12)
+} else {
+  cat("class_km column not found.\n")
+}
+```
+
+```{r}
+if ("class_km" %in% names(gc4)) {
+  cls <- gc4 |>
+    st_drop_geometry() |>
+    count(class_km, name = "n_hex") |>
+    mutate(share = n_hex / sum(n_hex)) |>
+    arrange(desc(n_hex))
+  top <- cls[1, ]
+  cat(paste0(
+    "**Key takeaway:** Largest group is cluster `", top$class_km,
+    "` with ", scales::percent(top$share, accuracy = 0.1),
+    " of all hexagons."
+  ))
+}
+```
+
+## Cluster Map (`class_km`)
+
+This map shows where each cluster appears geographically.  
+Look for contiguous zones (coherent areas) versus scattered patches (local pockets).
+
+```{r}
+if ("class_km" %in% names(gc4)) {
+  class_vals <- sort(unique(as.character(gc4$class_km)))
+  pal <- colorFactor(unname(class_palette[class_vals]), domain = class_vals)
+
+  leaflet(gc4) |>
+    addProviderTiles("CartoDB.Positron") |>
+    addPolygons(
+      fillColor = ~pal(class_km),
+      fillOpacity = 0.65,
+      color = "#444444",
+      weight = 0.4,
+      popup = ~paste0("hex: ", hex_id, "<br>class_km: ", class_km)
+    ) |>
+    addLegend("bottomright", pal = pal, values = ~class_km, title = "class_km")
+} else {
+  cat("class_km column not found.\n")
+}
+```
+
+```{r}
+if ("class_km" %in% names(gc4)) {
+  ncls <- gc4 |>
+    st_drop_geometry() |>
+    summarise(n = n_distinct(class_km)) |>
+    pull(n)
+  cat(paste0(
+    "**Key takeaway:** The map contains ", ncls,
+    " cluster types. Use this layer first to locate broad spatial patterns."
+  ))
+}
+```
+
+## Factor Summary
+
+These summaries show the spread of each factor score across all hexagons
+(minimum, median, maximum).  
+A wider spread means the factor separates places more strongly.
+
+```{r}
+fcols <- grep("^F[0-9]+$", names(gc4), value = TRUE)
+if (length(fcols) > 0) {
+  gc4 |>
+    st_drop_geometry() |>
+    select(all_of(fcols)) |>
+    summary()
+} else {
+  cat("No factor columns (F1..Fn) found in the view.\n")
+}
+```
+
+```{r}
+if (length(fcols) > 0) {
+  spread_df <- gc4 |>
+    st_drop_geometry() |>
+    summarise(across(all_of(fcols), ~sd(.x, na.rm = TRUE))) |>
+    pivot_longer(everything(), names_to = "factor", values_to = "sd_val") |>
+    arrange(desc(sd_val))
+  cat(paste0(
+    "**Key takeaway:** `", spread_df$factor[1],
+    "` has the widest spread (SD=", round(spread_df$sd_val[1], 2),
+    "), so it separates places most strongly."
+  ))
+}
+```
+
+## Bornholm Factor Loadings Matrix
+
+This table shows which original indicators contribute most to each factor.  
+Large positive/negative values mean stronger influence on that factor.
+
+```{r}
+#| label: loadings-matrix
+loadings_candidates <- c(
+  file.path(project_root, "jyp_note_book_geocontext", "bornholm_r8_factor_loadings_gc4.csv"),
+  file.path(project_root, "bornholm_r8_factor_loadings_gc4.csv"),
+  "jyp_note_book_geocontext/bornholm_r8_factor_loadings_gc4.csv",
+  "bornholm_r8_factor_loadings_gc4.csv"
+)
+loadings_path <- loadings_candidates[file.exists(loadings_candidates)][1]
+
+if (is.na(loadings_path) || !nzchar(loadings_path)) {
+  cat("Could not find bornholm_r8_factor_loadings_gc4.csv\n")
+} else {
+  loadings_df <- read.csv(loadings_path, stringsAsFactors = FALSE)
+  cat("Loadings file:", loadings_path, "\n")
+  cat("Rows:", nrow(loadings_df), "Cols:", ncol(loadings_df), "\n")
+  knitr::kable(loadings_df, digits = 3)
+}
+```
+
+```{r}
+#| label: loadings-heatmap
+if (exists("loadings_df")) {
+  fcols_load <- intersect(c("F1", "F2", "F3", "F4", "F5"), names(loadings_df))
+  loadings_long <- loadings_df |>
+    select(variable, all_of(fcols_load)) |>
+    pivot_longer(cols = all_of(fcols_load), names_to = "factor", values_to = "loading")
+
+  ggplot(loadings_long, aes(x = factor, y = variable, fill = loading)) +
+    geom_tile() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B", midpoint = 0) +
+    labs(x = "Factor", y = "Variable", fill = "Loading") +
+    theme_minimal(base_size = 10) +
+    theme(axis.text.y = element_text(size = 7))
+}
+```
+
+The heatmap is the same information as the matrix, but visual:
+strong colors mean stronger loadings.
+
+```{r}
+if (exists("loadings_df")) {
+  fcols_load <- intersect(c("F1", "F2", "F3", "F4", "F5"), names(loadings_df))
+  top_by_factor <- lapply(fcols_load, function(f) {
+    row <- loadings_df |>
+      transmute(variable, loading = .data[[f]], abs_loading = abs(loading)) |>
+      arrange(desc(abs_loading)) |>
+      slice(1)
+    paste0(f, " \u2192 ", row$variable, " (", round(row$loading, 3), ")")
+  })
+  cat(paste0("**Key takeaway:** Strongest single loading per factor: ", paste(unlist(top_by_factor), collapse = "; "), "."))
+}
+```
+
+## Factor Loadings vs K Neighbors (Mean)
+
+This plot shows whether factor meaning stays stable when neighborhood size (`k`)
+changes.  
+Stable lines across `k` mean more robust interpretation.
+
+```{r}
+#| label: loadings-vs-k-mean
+if (exists("loadings_df")) {
+  fcols_load <- intersect(c("F1", "F2", "F3", "F4", "F5"), names(loadings_df))
+
+  loadings_mean_long <- loadings_df |>
+    filter(str_detect(variable, "^mean_")) |>
+    mutate(
+      k = as.integer(str_extract(variable, "(?<=_k)[0-9]+$")),
+      series = str_remove(variable, "^mean_"),
+      series = str_remove(series, "_k[0-9]+$"),
+      indicator = indicator_key(series)
+    ) |>
+    pivot_longer(cols = all_of(fcols_load), names_to = "factor", values_to = "loading") |>
+    filter(!is.na(k))
+
+  if (nrow(loadings_mean_long) > 0) {
+    end_labels <- loadings_mean_long |>
+      group_by(factor, series) |>
+      filter(k == max(k)) |>
+      slice(1) |>
+      ungroup()
+
+    ggplot(loadings_mean_long, aes(x = k, y = loading, color = indicator, group = series)) +
+      geom_hline(yintercept = 0, linewidth = 0.35, color = "black") +
+      geom_line(linewidth = 0.8) +
+      geom_point(size = 1.2) +
+      geom_text(
+        data = end_labels,
+        aes(label = series),
+        hjust = -0.08,
+        size = 2.9,
+        show.legend = FALSE
+      ) +
+      facet_wrap(~ factor, ncol = 1) +
+      scale_color_manual(values = indicator_palette, drop = FALSE) +
+      scale_x_continuous(breaks = sort(unique(loadings_mean_long$k))) +
+      coord_cartesian(ylim = c(-1, 1), clip = "off") +
+      labs(
+        title = "Factor loadings vs K neighbors (mean)",
+        x = "K neighbors",
+        y = "Factor loadings",
+        color = "Series"
+      ) +
+      theme_minimal(base_size = 12) +
+      theme(
+        legend.position = "none",
+        plot.margin = margin(5.5, 90, 5.5, 5.5)
+      )
+  } else {
+    cat("No mean_* loadings available for K-plot.\n")
+  }
+}
+```
+
+```{r}
+if (exists("loadings_mean_long") && nrow(loadings_mean_long) > 0) {
+  stab <- loadings_mean_long |>
+    group_by(factor, series) |>
+    summarise(range_abs = max(loading, na.rm = TRUE) - min(loading, na.rm = TRUE), .groups = "drop") |>
+    group_by(factor) |>
+    summarise(mean_range = mean(range_abs, na.rm = TRUE), .groups = "drop") |>
+    arrange(mean_range)
+  cat(paste0(
+    "**Key takeaway:** Most stable factor across k is `", stab$factor[1],
+    "` (smallest average loading drift)."
+  ))
+}
+```
+
+## Per-Factor Pages
+
+- Interpretation hub: [bornholm_gc4_index.html](./bornholm_gc4_index.html)
+- [F1 page](./bornholm_gc4_F1.html)
+- [F2 page](./bornholm_gc4_F2.html)
+- [F3 page](./bornholm_gc4_F3.html)
+- [F4 page](./bornholm_gc4_F4.html)
+- [F5 page](./bornholm_gc4_F5.html)
+
+## Mean Indicator Trends Across K
+
+These plots show how average indicator values change when context size (`k`) grows.  
+Use them to see if local patterns persist at broader neighborhood scales.
+
+```{r}
+#| label: prep-k-trends
+k_target <- c(10, 50, 100, 250, 1000)
+
+mean_cols <- names(feat)[str_detect(names(feat), "^mean_gc_.*_k[0-9]+$")]
+if (length(mean_cols) == 0) {
+  cat("No mean_gc_*_k* columns found in feature table.\n")
+} else {
+  mean_long <- feat |>
+    select(any_of(c("hex_id", "class_km")), all_of(mean_cols)) |>
+    pivot_longer(
+      cols = all_of(mean_cols),
+      names_to = "colname",
+      values_to = "value"
+    ) |>
+    mutate(
+      k = as.integer(str_extract(colname, "(?<=_k)[0-9]+$")),
+      variable = str_remove(colname, "^mean_"),
+      variable = str_remove(variable, "_k[0-9]+$"),
+      indicator = indicator_key(variable)
+    ) |>
+    filter(k %in% k_target)
+}
+```
+
+```{r}
+#| label: plot-k-trends-overall
+if (exists("mean_long")) {
+  mean_long |>
+    group_by(variable, indicator, k) |>
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") |>
+    ggplot(aes(x = k, y = mean_value, color = indicator)) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.6) +
+    scale_color_manual(values = indicator_palette, drop = FALSE) +
+    scale_x_continuous(breaks = c(10, 50, 100, 250, 1000)) +
+    labs(
+      x = "k (nearest neighbours)",
+      y = "Mean indicator value",
+      color = "Indicator"
+    ) +
+    theme_minimal(base_size = 12)
+}
+```
+
+```{r}
+if (exists("mean_long") && nrow(mean_long) > 0) {
+  trend <- mean_long |>
+    group_by(variable, k) |>
+    summarise(v = mean(value, na.rm = TRUE), .groups = "drop") |>
+    group_by(variable) |>
+    summarise(delta = v[k == max(k)] - v[k == min(k)], .groups = "drop") |>
+    arrange(desc(abs(delta)))
+  cat(paste0(
+    "**Key takeaway:** Biggest k-scale change appears in `", trend$variable[1],
+    "` (\u0394=", round(trend$delta[1], 3), ")."
+  ))
+}
+```
+
+```{r}
+#| label: plot-k-trends-by-cluster
+if (exists("mean_long") && "class_km" %in% names(mean_long)) {
+  mean_long |>
+    filter(!is.na(class_km)) |>
+    group_by(class_km, variable, k) |>
+    summarise(mean_value = mean(value, na.rm = TRUE), .groups = "drop") |>
+    ggplot(aes(x = k, y = mean_value, color = factor(class_km))) +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.5) +
+    scale_color_manual(values = class_palette, drop = FALSE) +
+    scale_x_continuous(breaks = c(10, 50, 100, 250, 1000)) +
+    labs(
+      x = "k (nearest neighbours)",
+      y = "Mean indicator value",
+      color = "class_km"
+    ) +
+    facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+    theme_minimal(base_size = 11)
+}
+```
+
+## Factor Correlation With Indicators Across K
+
+These panels show how strongly each indicator tracks each factor at different `k`.
+They help answer: which indicators actually drive each factor, and is that stable?
+
+```{r}
+#| label: factor-k-correlation
+fcols_feat <- intersect(c("F1", "F2", "F3", "F4", "F5"), names(feat))
+if (length(fcols_feat) == 0 || length(mean_cols) == 0) {
+  cat("Missing factors or mean indicator columns for correlation analysis.\n")
+} else {
+  corr_rows <- list()
+  i <- 1L
+  for (f in fcols_feat) {
+    for (mc in mean_cols) {
+      k <- as.integer(str_extract(mc, "(?<=_k)[0-9]+$"))
+      if (!k %in% k_target) next
+      var_name <- str_remove(mc, "^mean_")
+      var_name <- str_remove(var_name, "_k[0-9]+$")
+      cc <- suppressWarnings(cor(feat[[f]], feat[[mc]], use = "pairwise.complete.obs"))
+      corr_rows[[i]] <- data.frame(
+        factor = f,
+        variable = var_name,
+        indicator = indicator_key(var_name),
+        k = k,
+        corr = as.numeric(cc)
+      )
+      i <- i + 1L
+    }
+  }
+  corr_df <- bind_rows(corr_rows)
+}
+```
+
+```{r}
+#| label: plot-factor-k-correlation
+if (exists("corr_df") && nrow(corr_df) > 0) {
+  corr_df |>
+    ggplot(aes(x = k, y = corr, color = indicator)) +
+    geom_hline(yintercept = 0, linewidth = 0.4, linetype = "dashed") +
+    geom_line(linewidth = 0.8) +
+    geom_point(size = 1.5) +
+    scale_color_manual(values = indicator_palette, drop = FALSE) +
+    scale_x_continuous(breaks = c(10, 50, 100, 250, 1000)) +
+    labs(
+      x = "k (nearest neighbours)",
+      y = "Correlation with factor score",
+      color = "Indicator"
+    ) +
+    facet_wrap(~ factor, ncol = 2) +
+    theme_minimal(base_size = 11)
+}
+```
+
+```{r}
+if (exists("corr_df") && nrow(corr_df) > 0) {
+  top_corr <- corr_df |>
+    mutate(abs_corr = abs(corr)) |>
+    arrange(desc(abs_corr)) |>
+    slice(1)
+  cat(paste0(
+    "**Key takeaway:** Strongest factor-indicator link is ",
+    top_corr$factor, " with `", top_corr$variable,
+    "` at k=", top_corr$k, " (r=", round(top_corr$corr, 3), ")."
+  ))
+}
+```
+
+```{r}
+#| label: disconnect
+if (exists("con") && DBI::dbIsValid(con)) {
+  DBI::dbDisconnect(con)
+}
+```
